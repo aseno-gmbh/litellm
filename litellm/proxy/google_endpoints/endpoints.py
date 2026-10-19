@@ -1,19 +1,135 @@
-from datetime import datetime
+from collections.abc import Mapping
+from itertools import chain
+from types import MappingProxyType
+from typing import Final
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import ORJSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, ORJSONResponse
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
 
-import litellm
-from litellm._uuid import uuid
+from litellm.litellm_core_utils.json_validation_rule import normalize_json_schema_types
 from litellm.proxy._types import *
+from litellm.proxy._types import ProxyException, TokenCountRequest
 from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth, user_api_key_auth
-from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
-from litellm.proxy.common_utils.http_parsing_utils import _read_request_body
+from litellm.proxy.common_request_processing import (
+    ProxyBaseLLMRequestProcessing,
+    log_llm_api_exception,
+    proxy_exception_from_http_exception,
+    resolve_litellm_call_id,
+)
+from litellm.proxy.common_utils.http_parsing_utils import (  # noqa: F401  # legacy module exports
+    _read_request_body,  # pyright: ignore[reportPrivateUsage,reportUnusedImport]  # backwards-compatible package export
+    read_request_body,
+)
+from litellm.proxy.common_utils.token_count_settings import count_source_fields
 from litellm.types.llms.vertex_ai import TokenCountDetailsResponse
 
-router = APIRouter(
+
+class _GoogleCountTokensTextPart(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    text: str
+
+
+class _GoogleCountTokensSystemInstruction(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    parts: tuple[_GoogleCountTokensTextPart, ...]
+
+
+class _GoogleCountTokensFunctionDeclaration(BaseModel):
+    model_config = ConfigDict(frozen=True, populate_by_name=True)
+    name: str
+    description: str | None = None
+    parameters: JsonValue | None = None
+    parameters_json_schema: JsonValue | None = Field(default=None, alias="parametersJsonSchema")
+
+
+class _GoogleCountTokensTool(BaseModel):
+    model_config = ConfigDict(frozen=True, populate_by_name=True)
+    function_declarations: tuple[_GoogleCountTokensFunctionDeclaration, ...] = Field(
+        default=(), alias="functionDeclarations"
+    )
+
+
+class _GoogleCountTokensRequest(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="ignore", populate_by_name=True)
+    contents: tuple[Mapping[str, JsonValue], ...] = ()
+    system_instruction: _GoogleCountTokensSystemInstruction | None = Field(default=None, alias="systemInstruction")
+    tools: tuple[_GoogleCountTokensTool, ...] = ()
+
+
+router: Final = APIRouter(
     tags=["google genai endpoints"],
 )
+
+
+def _input_schema(declaration: _GoogleCountTokensFunctionDeclaration) -> object:
+    if declaration.parameters_json_schema is not None:
+        return declaration.parameters_json_schema
+    if declaration.parameters is not None:
+        return normalize_json_schema_types(declaration.parameters)
+    return {"type": "object", "properties": {}}
+
+
+_GOOGLE_RPC_STATUS: Final = MappingProxyType(
+    {
+        400: "INVALID_ARGUMENT",
+        401: "UNAUTHENTICATED",
+        403: "PERMISSION_DENIED",
+        404: "NOT_FOUND",
+        409: "ABORTED",
+        429: "RESOURCE_EXHAUSTED",
+        499: "CANCELLED",
+        501: "UNIMPLEMENTED",
+        503: "UNAVAILABLE",
+        504: "DEADLINE_EXCEEDED",
+    }
+)
+
+
+def _google_error_response(request: Request, error: ProxyException) -> JSONResponse:
+    from litellm.proxy.proxy_server import (
+        _close_dangling_otel_server_span,  # pyright: ignore[reportPrivateUsage]  # proxy_server keeps the span-close helper private; error JSONResponses returned by the route must stamp the OTel server span like the global ProxyException handler does
+    )
+
+    status_code: Final = int(error.code) if error.code is not None and error.code.isdigit() else 500
+    _close_dangling_otel_server_span(request, status_code, exc=error)
+    status: Final = _GOOGLE_RPC_STATUS.get(status_code, "INTERNAL" if status_code >= 500 else "FAILED_PRECONDITION")
+    return JSONResponse(
+        status_code=status_code,
+        content={"error": {"code": status_code, "message": error.message, "status": status}},
+        headers=error.headers,
+    )
+
+
+def _google_count_tokens_request(model_name: str, data: object) -> TokenCountRequest:
+    from litellm.google_genai.adapters.transformation import GoogleGenAIAdapter
+
+    validated_data: Final = TypeAdapter(_GoogleCountTokensRequest).validate_python(data)
+    contents: Final = [dict(content) for content in validated_data.contents]
+    messages: Final = (
+        GoogleGenAIAdapter().translate_generate_content_to_completion(model_name, contents).get("messages", [])
+    )
+    system: Final = (
+        [{"type": "text", "text": part.text} for part in validated_data.system_instruction.parts]
+        if validated_data.system_instruction is not None
+        else None
+    )
+    declarations: Final = chain.from_iterable(tool.function_declarations for tool in validated_data.tools)
+    tools: Final = [
+        {
+            "name": declaration.name,
+            **({"description": declaration.description} if declaration.description is not None else {}),
+            "input_schema": _input_schema(declaration),
+        }
+        for declaration in declarations
+    ]
+    return TokenCountRequest(
+        model=model_name,
+        contents=contents,
+        messages=messages,
+        system=system,
+        tools=tools or None,
+    )
 
 
 @router.post(
@@ -30,50 +146,51 @@ async def google_generate_content(
     fastapi_response: Response,
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
 ):
-    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
     from litellm.proxy.proxy_server import (
         general_settings,
         llm_router,
         proxy_config,
+        proxy_logging_obj,
+        select_data_generator,
+        user_api_base,
+        user_max_tokens,
+        user_model,
+        user_request_timeout,
+        user_temperature,
         version,
     )
 
-    data = await _read_request_body(request=request)
+    data: Final = await read_request_body(request=request)
     if "model" not in data:
         data["model"] = model_name
 
-    # Extract generationConfig and pass it as config parameter
-    generation_config = data.pop("generationConfig", None)
-    if generation_config:
-        data["config"] = generation_config
-
-    # Add user authentication metadata for cost tracking
-    data = await add_litellm_data_to_request(
-        data=data,
-        request=request,
-        user_api_key_dict=user_api_key_dict,
-        proxy_config=proxy_config,
-        general_settings=general_settings,
-        version=version,
-    )
-
-    # Create logging object with full request metadata so callbacks (e.g. S3) get user/trace_id
-    data["litellm_call_id"] = request.headers.get(
-        "x-litellm-call-id", str(uuid.uuid4())
-    )
-    logging_obj, data = litellm.utils.function_setup(
-        original_function="agenerate_content",
-        rules_obj=litellm.utils.Rules(),
-        start_time=datetime.now(),
-        **data,
-    )
-    data["litellm_logging_obj"] = logging_obj
-
-    # call router
-    if llm_router is None:
-        raise HTTPException(status_code=500, detail="Router not initialized")
-    response = await llm_router.agenerate_content(**data)
-    return response
+    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
+    try:
+        return await processor.base_process_llm_request(
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            route_type="agenerate_content",
+            proxy_logging_obj=proxy_logging_obj,
+            llm_router=llm_router,
+            general_settings=general_settings,
+            proxy_config=proxy_config,
+            select_data_generator=select_data_generator,
+            model=model_name,
+            user_model=user_model,
+            user_temperature=user_temperature,
+            user_request_timeout=user_request_timeout,
+            user_max_tokens=user_max_tokens,
+            user_api_base=user_api_base,
+            version=version,
+        )
+    except Exception as e:
+        raise await processor.handle_llm_api_exception(
+            e=e,
+            user_api_key_dict=user_api_key_dict,
+            proxy_logging_obj=proxy_logging_obj,
+            version=version,
+        )
 
 
 @router.post(
@@ -90,57 +207,55 @@ async def google_stream_generate_content(
     fastapi_response: Response,
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
 ):
-    from litellm.proxy.litellm_pre_call_utils import add_litellm_data_to_request
     from litellm.proxy.proxy_server import (
         general_settings,
         llm_router,
         proxy_config,
+        proxy_logging_obj,
+        select_data_generator,
+        user_api_base,
+        user_max_tokens,
+        user_model,
+        user_request_timeout,
+        user_temperature,
         version,
     )
 
-    data = await _read_request_body(request=request)
-
+    data: Final = await read_request_body(request=request)
     if "model" not in data:
         data["model"] = model_name
+    data["stream"] = True
+    # google-genai SDK (?alt=sse) must not receive OpenAI's data: [DONE] terminator.
+    data["_litellm_skip_openai_stream_done"] = True
+    data["_litellm_raw_sse_stream"] = True
 
-    data["stream"] = True  # enforce streaming for this endpoint
-
-    # Extract generationConfig and pass it as config parameter
-    generation_config = data.pop("generationConfig", None)
-    if generation_config:
-        data["config"] = generation_config
-
-    # Add user authentication metadata for cost tracking
-    data = await add_litellm_data_to_request(
-        data=data,
-        request=request,
-        user_api_key_dict=user_api_key_dict,
-        proxy_config=proxy_config,
-        general_settings=general_settings,
-        version=version,
-    )
-
-    # Create logging object with full request metadata so streaming END callbacks (e.g. S3) get user/trace_id
-    data["litellm_call_id"] = request.headers.get(
-        "x-litellm-call-id", str(uuid.uuid4())
-    )
-    logging_obj, data = litellm.utils.function_setup(
-        original_function="agenerate_content_stream",
-        rules_obj=litellm.utils.Rules(),
-        start_time=datetime.now(),
-        **data,
-    )
-    data["litellm_logging_obj"] = logging_obj
-
-    # call router
-    if llm_router is None:
-        raise HTTPException(status_code=500, detail="Router not initialized")
-    response = await llm_router.agenerate_content_stream(**data)
-
-    # Check if response is an async iterator (streaming response)
-    if response is not None and hasattr(response, "__aiter__"):
-        return StreamingResponse(content=response, media_type="text/event-stream")
-    return response
+    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
+    try:
+        return await processor.base_process_llm_request(
+            request=request,
+            fastapi_response=fastapi_response,
+            user_api_key_dict=user_api_key_dict,
+            route_type="agenerate_content_stream",
+            proxy_logging_obj=proxy_logging_obj,
+            llm_router=llm_router,
+            general_settings=general_settings,
+            proxy_config=proxy_config,
+            select_data_generator=select_data_generator,
+            model=model_name,
+            user_model=user_model,
+            user_temperature=user_temperature,
+            user_request_timeout=user_request_timeout,
+            user_max_tokens=user_max_tokens,
+            user_api_base=user_api_base,
+            version=version,
+        )
+    except Exception as e:
+        raise await processor.handle_llm_api_exception(
+            e=e,
+            user_api_key_dict=user_api_key_dict,
+            proxy_logging_obj=proxy_logging_obj,
+            version=version,
+        )
 
 
 @router.post(
@@ -168,54 +283,39 @@ async def google_count_tokens(request: Request, model_name: str):
     }
     ```
     """
-    from litellm.google_genai.adapters.transformation import GoogleGenAIAdapter
-    from litellm.proxy.common_utils.http_parsing_utils import _read_request_body
+    from litellm.proxy.common_utils.http_parsing_utils import read_request_body
     from litellm.proxy.proxy_server import token_counter as internal_token_counter
 
-    data = await _read_request_body(request=request)
-    contents = data.get("contents", [])
-    # Create TokenCountRequest for the internal endpoint
-    from litellm.proxy._types import TokenCountRequest
+    data: Final = await read_request_body(request=request)
+    try:
+        token_request: Final = _google_count_tokens_request(model_name, data)
+    except ValidationError:
+        return _google_error_response(
+            request,
+            ProxyException(
+                message="Invalid Google countTokens request body", type="invalid_request_error", param=None, code=400
+            ),
+        )
 
-    # Translate contents to openai format messages using the adapter
-    messages = (
-        GoogleGenAIAdapter()
-        .translate_generate_content_to_completion(model_name, contents)
-        .get("messages", [])
-    )
-
-    token_request = TokenCountRequest(
-        model=model_name,
-        contents=contents,
-        messages=messages,  # compatibility when use openai-like endpoint
-    )
-
-    # Call the internal token counter function with direct request flag set to False
-    token_response = await internal_token_counter(
-        request=token_request,
-        call_endpoint=True,
-    )
-    if token_response is not None:
-        # cast the response to the well known format
-        original_response: dict = token_response.original_response or {}
-        if original_response:
-            return TokenCountDetailsResponse(
-                totalTokens=original_response.get("totalTokens", 0),
-                promptTokensDetails=original_response.get("promptTokensDetails", []),
-            )
-        else:
-            return TokenCountDetailsResponse(
-                totalTokens=token_response.total_tokens or 0,
-                promptTokensDetails=[],
-            )
-
-    #########################################################
-    # Return the response in the well known format
-    #########################################################
-    return TokenCountDetailsResponse(
-        totalTokens=0,
-        promptTokensDetails=[],
-    )
+    try:
+        token_response: Final = await internal_token_counter(request=token_request, call_endpoint=True)
+    except ProxyException as error:
+        return _google_error_response(request, error)
+    except HTTPException as error:
+        return _google_error_response(request, proxy_exception_from_http_exception(error, {}))
+    except Exception as error:
+        log_llm_api_exception(error, resolve_litellm_call_id(request.headers.get("x-litellm-call-id")))
+        return _google_error_response(
+            request,
+            ProxyException(message="Internal server error", type="internal_server_error", param=None, code=500),
+        )
+    original_response: Final[dict] = token_response.original_response or {}
+    counted: Final[TokenCountDetailsResponse] = {
+        "totalTokens": original_response.get("totalTokens") or token_response.total_tokens or 0,
+        "promptTokensDetails": original_response.get("promptTokensDetails", []),
+        **count_source_fields(token_response),
+    }
+    return counted
 
 
 # ============================================================
@@ -253,7 +353,7 @@ async def create_interaction(
     Example:
     ```bash
     curl -X POST "http://localhost:4000/v1beta/interactions" \
-        -H "Authorization: Bearer sk-1234" \
+        -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
         -H "Content-Type: application/json" \
         -d '{
             "model": "gemini/gemini-2.5-flash",
@@ -275,13 +375,13 @@ async def create_interaction(
         version,
     )
 
-    data = await _read_request_body(request=request)
+    data: Final = await read_request_body(request=request)
 
     # Default to gemini provider for interactions
     if "custom_llm_provider" not in data:
         data["custom_llm_provider"] = "gemini"
 
-    processor = ProxyBaseLLMRequestProcessing(data=data)
+    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
     try:
         return await processor.base_process_llm_request(
             request=request,
@@ -293,7 +393,7 @@ async def create_interaction(
             general_settings=general_settings,
             proxy_config=proxy_config,
             select_data_generator=select_data_generator,
-            model=data.get("model") or data.get("agent"),
+            model=data.get("model"),
             user_model=user_model,
             user_temperature=user_temperature,
             user_request_timeout=user_request_timeout,
@@ -302,7 +402,7 @@ async def create_interaction(
             version=version,
         )
     except Exception as e:
-        raise await processor._handle_llm_api_exception(
+        raise await processor.handle_llm_api_exception(
             e=e,
             user_api_key_dict=user_api_key_dict,
             proxy_logging_obj=proxy_logging_obj,
@@ -347,9 +447,9 @@ async def get_interaction(
         version,
     )
 
-    data = {"interaction_id": interaction_id, "custom_llm_provider": "gemini"}
+    data: Final = {"interaction_id": interaction_id, "custom_llm_provider": "gemini"}
 
-    processor = ProxyBaseLLMRequestProcessing(data=data)
+    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
     try:
         return await processor.base_process_llm_request(
             request=request,
@@ -370,7 +470,7 @@ async def get_interaction(
             version=version,
         )
     except Exception as e:
-        raise await processor._handle_llm_api_exception(
+        raise await processor.handle_llm_api_exception(
             e=e,
             user_api_key_dict=user_api_key_dict,
             proxy_logging_obj=proxy_logging_obj,
@@ -415,9 +515,9 @@ async def delete_interaction(
         version,
     )
 
-    data = {"interaction_id": interaction_id, "custom_llm_provider": "gemini"}
+    data: Final = {"interaction_id": interaction_id, "custom_llm_provider": "gemini"}
 
-    processor = ProxyBaseLLMRequestProcessing(data=data)
+    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
     try:
         return await processor.base_process_llm_request(
             request=request,
@@ -438,7 +538,7 @@ async def delete_interaction(
             version=version,
         )
     except Exception as e:
-        raise await processor._handle_llm_api_exception(
+        raise await processor.handle_llm_api_exception(
             e=e,
             user_api_key_dict=user_api_key_dict,
             proxy_logging_obj=proxy_logging_obj,
@@ -467,7 +567,7 @@ async def cancel_interaction(
     """
     Cancel an interaction by ID.
 
-    Per OpenAPI spec: POST /{api_version}/interactions/{interaction_id}:cancel
+    Per OpenAPI spec: POST /{api_version}/interactions/{interaction_id}/cancel
     """
     from litellm.proxy.proxy_server import (
         general_settings,
@@ -483,9 +583,9 @@ async def cancel_interaction(
         version,
     )
 
-    data = {"interaction_id": interaction_id, "custom_llm_provider": "gemini"}
+    data: Final = {"interaction_id": interaction_id, "custom_llm_provider": "gemini"}
 
-    processor = ProxyBaseLLMRequestProcessing(data=data)
+    processor: Final = ProxyBaseLLMRequestProcessing(data=data)
     try:
         return await processor.base_process_llm_request(
             request=request,
@@ -506,7 +606,7 @@ async def cancel_interaction(
             version=version,
         )
     except Exception as e:
-        raise await processor._handle_llm_api_exception(
+        raise await processor.handle_llm_api_exception(
             e=e,
             user_api_key_dict=user_api_key_dict,
             proxy_logging_obj=proxy_logging_obj,
